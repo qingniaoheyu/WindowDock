@@ -2,6 +2,28 @@
 
 Windows 桌面窗口停靠栏，可将多个应用窗口排列在屏幕边缘，并提供带独立截止时间的任务清单。
 
+## 下载
+
+[下载 v1.0.0（Windows x64 ZIP）](https://github.com/qingniaoheyu/WindowDock/releases/download/v1.0.0/WindowDock-v1.0.0-win-x64.zip)，解压后双击 `WindowDock.exe` 即可运行，无需安装。适用于 Windows 10/11 x64，需要 .NET Framework 4.x 运行环境。
+
+[Release 页面](https://github.com/qingniaoheyu/WindowDock/releases/tag/v1.0.0)同时提供独立 EXE 和 `SHA256SUMS.txt` 校验文件。
+
+## 界面截图
+
+主界面展示当前 v1.0.0 的单排和田字格布局，使用示例窗口与任务内容；设置截图来自当前设置页面。
+
+### 单排与任务清单
+
+![WindowDock 单排布局和任务 deadline](docs/screenshots/windowdock-main.png)
+
+### 田字格布局
+
+![WindowDock 2×2 田字格布局](docs/screenshots/windowdock-grid.png)
+
+### 设置
+
+![WindowDock 当前设置页面](docs/screenshots/windowdock-settings.png)
+
 ## 功能
 
 - 最多管理 8 个窗口，支持单排、田字格（2×2）和自定义行列。
@@ -53,7 +75,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\build.ps1
 
 调试日志为 `WindowDock_dbg.log`，卡顿超过两秒时记录当前操作，相关记录包含 `[ysw]`。异常日志为 `WindowDock_error.log`。
 
-个人配置、日志、截图、构建产物和本地排障文件不会提交到仓库。
+个人配置、日志、原始个人截图和本地排障文件不会提交到仓库。公开展示截图保存在 `docs/screenshots`，构建产物通过 GitHub Release 提供。
 
 ## 回归验证
 
