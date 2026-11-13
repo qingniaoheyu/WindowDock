@@ -1,0 +1,32 @@
+# Local builds and personal settings
+dist/
+*.exe
+*.pdb
+*.ini
+*.log
+*.bak
+*.dmp
+*.tmp
+
+# Keep only the portable regression test sources and runners
+_probe/
+_test/*
+!_test/feature_validation/
+!_test/layout_validation/
+!_test/hang_validation/
+_test/*/*
+!_test/feature_validation/FeatureValidation.cs
+!_test/feature_validation/PreviewHost.cs
+!_test/feature_validation/QtRenderingHost.cs
+!_test/feature_validation/run.ps1
+!_test/layout_validation/LayoutValidation.cs
+!_test/layout_validation/run.ps1
+!_test/hang_validation/HangHost.cs
+!_test/hang_validation/HangValidation.cs
+!_test/hang_validation/run.ps1
+
+# Editor files
+.vs/
+.vscode/
+*.user
+*.suo
