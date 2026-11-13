@@ -12,9 +12,13 @@ namespace WindowDock
             if (name == "#32768" || name == "tooltips_class32" || name == "SysShadow" ||
                 name == "IME" || name == "MSCTFIME UI" || name == "NativeHWNDHost" ||
                 name.StartsWith("Microsoft.IME.", StringComparison.Ordinal) ||
-                name.IndexOf("IME.UIManager", StringComparison.OrdinalIgnoreCase) >= 0 ||
-                name.IndexOf("QWindowToolTip", StringComparison.Ordinal) >= 0 ||
-                name.IndexOf("QWindowToolSaveBits", StringComparison.Ordinal) >= 0)
+                name.IndexOf("IME.UIManager", StringComparison.OrdinalIgnoreCase) >= 0)
+                return true;
+            // 普通 Qt 悬浮提示和提示窗口的阴影仍然跳过；ToolTipSaveBits 是 UME 的
+            // 表情/贴纸面板本体，需要作为弹层参与置顶，否则会被停靠槽位窗口盖住。
+            if (name.IndexOf("QWindowToolTip", StringComparison.Ordinal) >= 0 &&
+                (name.IndexOf("SaveBits", StringComparison.Ordinal) < 0 ||
+                 name.IndexOf("DropShadowSaveBits", StringComparison.Ordinal) >= 0))
                 return true;
 
             // Qt 的阴影是独立的逐像素透明窗口，围在真正的窗口外，不能作为预览置顶或隐藏。
@@ -27,7 +31,29 @@ namespace WindowDock
             if (Native.GetLayeredWindowAttributes(hwnd, out colorKey, out alpha, out flags)) return false;
             Rectangle rect = Native.GetWindowRectangle(hwnd);
             Rectangle ownerRect = Native.GetWindowRectangle(owner);
-            return ownerRect.Width > 0 && ownerRect.Height > 0 && rect.Contains(ownerRect);
+            // 阴影窗口总是比 owner 四周各大一圈；与 owner 同尺寸的是 Qt Quick 的
+            // 透明覆盖窗口（表情面板等弹层绘制在这里），必须作为弹层接管。
+            return ownerRect.Width > 0 && ownerRect.Height > 0 &&
+                rect.Width > ownerRect.Width && rect.Height > ownerRect.Height &&
+                rect.Contains(ownerRect);
+        }
+
+        private static bool IsNotificationWindow(IntPtr hwnd)
+        {
+            // Yealink UME 等 Qt 应用用 ToolSaveBits 工具窗口显示“新消息”提醒气泡。
+            return Native.GetWindowClassName(hwnd).IndexOf("QWindowToolSaveBits", StringComparison.Ordinal) >= 0;
+        }
+
+        private void ClearUnreadForForeground(IntPtr foreground)
+        {
+            if (foreground == IntPtr.Zero) return;
+            IntPtr root = Native.GetAncestor(foreground, Native.GA_ROOT);
+            for (int i = 0; i < _slots.Count; i++)
+            {
+                SlotState s = _slots[i];
+                if (!s.Unread || s.Hwnd == IntPtr.Zero) continue;
+                if (root == s.Hwnd || foreground == s.Hwnd) SetSlotUnread(i, false);
+            }
         }
 
         private void CaptureExistingWindows(SlotState slot)
@@ -39,7 +65,11 @@ namespace WindowDock
             {
                 uint pid;
                 Native.GetWindowThreadProcessId(hwnd, out pid);
-                if (pid == processId && Native.IsWindowVisible(hwnd)) slot.ExistingWindows.Add(hwnd);
+                // 工具窗口（消息提醒气泡等）不参与“绑定前已存在”快照，
+                // 否则绑定后弹出的通知无法被接管置顶。
+                if (pid == processId && Native.IsWindowVisible(hwnd) &&
+                    (Native.GetWindowLong(hwnd, Native.GWL_EXSTYLE) & Native.WS_EX_TOOLWINDOW) == 0)
+                    slot.ExistingWindows.Add(hwnd);
                 return true;
             }, IntPtr.Zero);
         }
@@ -63,18 +93,20 @@ namespace WindowDock
                 owner = Native.GetWindow(owner, Native.GW_OWNER);
             }
 
-            // Qt/Electron 有时创建无 owner 的预览，只接管绑定后新出现且被激活的同进程窗口。
-            // 绑定前已有的同进程主窗口不参与联动。
-            if (Native.GetAncestor(foreground, Native.GA_ROOT) != hwnd) return null;
             uint popupPid;
             Native.GetWindowThreadProcessId(hwnd, out popupPid);
             if (popupPid == 0) return null;
+
+            // 无 owner 的 Qt 工具窗口（表情/贴纸面板、消息提醒等）按进程归属到已停靠窗口。
+            // 绑定前已有的窗口不参与，避免把应用的其他主窗口误判为弹层。
+            bool toolWindow = (Native.GetWindowLong(hwnd, Native.GWL_EXSTYLE) & Native.WS_EX_TOOLWINDOW) != 0;
             foreach (SlotState slot in _slots)
             {
                 if (slot.Hwnd == IntPtr.Zero || !Native.IsWindow(slot.Hwnd) || slot.ExistingWindows.Contains(hwnd)) continue;
                 uint slotPid;
                 Native.GetWindowThreadProcessId(slot.Hwnd, out slotPid);
-                if (slotPid == popupPid) return slot;
+                if (slotPid != popupPid) continue;
+                if (toolWindow || Native.GetAncestor(foreground, Native.GA_ROOT) == hwnd) return slot;
             }
             return null;
         }
@@ -108,16 +140,21 @@ namespace WindowDock
                     popup.Hwnd = hwnd;
                     popup.DockedHwnd = slot.Hwnd;
                     popup.ThreadId = Native.GetWindowThreadProcessId(hwnd, out popup.ProcessId);
-                    popup.OriginalTopmost = (Native.GetWindowLong(hwnd, Native.GWL_EXSTYLE) & Native.WS_EX_TOPMOST) != 0;
+                    int exStyle = Native.GetWindowLong(hwnd, Native.GWL_EXSTYLE);
+                    popup.OriginalTopmost = (exStyle & Native.WS_EX_TOPMOST) != 0;
+                    bool notification = IsNotificationWindow(hwnd);
+                    // 通知气泡即使挂在主窗口下也不能随停靠栏隐藏，否则错过消息时看不到提示。
+                    popup.Transient = notification || ((exStyle & Native.WS_EX_TOOLWINDOW) != 0 &&
+                        Native.GetWindow(hwnd, Native.GW_OWNER) == IntPtr.Zero);
                     _popups.Add(hwnd, popup);
                     ApplyWindowOpacity(hwnd);
-                    YswLog("track popup hwnd=" + hwnd + " owner=" + slot.Hwnd);
+                    YswLog("track popup hwnd=" + hwnd + " cls=" + Native.GetWindowClassName(hwnd) +
+                        " owner=" + slot.Hwnd + (popup.Transient ? " transient" : "") +
+                        (notification ? " notification" : ""));
+                    if (notification) SetSlotUnread(_slots.IndexOf(slot), true);
                 }
-                if (!_visible)
-                {
-                    popup.HiddenByUs = true;
-                    Native.ShowWindow(hwnd, Native.SW_HIDE);
-                }
+                // 停靠栏隐藏期间新出现的弹窗通常是应用自己的消息提醒，保持显示，
+                // 只有原本就随停靠栏一起隐藏的弹窗才会在显示时恢复。
                 return true;
             }, IntPtr.Zero);
             if (_visible) RaisePopupsAboveDocked();
@@ -127,6 +164,7 @@ namespace WindowDock
         {
             foreach (PopupState popup in _popups.Values)
             {
+                if (popup.Transient) continue;
                 if (!popup.IsValid || !Native.IsWindowVisible(popup.Hwnd) || Native.IsIconic(popup.Hwnd)) continue;
                 popup.HiddenByUs = true;
             }

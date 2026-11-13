@@ -335,6 +335,9 @@ namespace WindowDock
         [DllImport("gdi32.dll")]
         public static extern bool DeleteObject(IntPtr hObject);
 
+        [DllImport("user32.dll", SetLastError = true)]
+        public static extern bool DestroyIcon(IntPtr hIcon);
+
         [DllImport("user32.dll", CharSet = CharSet.Unicode)]
         public static extern IntPtr SendMessage(IntPtr hWnd, uint Msg, IntPtr wParam, string lParam);
 

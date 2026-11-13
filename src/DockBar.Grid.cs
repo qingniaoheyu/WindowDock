@@ -95,8 +95,8 @@ namespace WindowDock
             int headerGap = header > 0 ? gap : 0;
             int[] widths = new int[columns], heights = new int[rows];
             int[] minimumWidths = new int[columns], minimumHeights = new int[rows];
-            for (int c = 0; c < columns; c++) { widths[c] = S(_cfg.SlotWidth); minimumWidths[c] = S(80); }
-            for (int r = 0; r < rows; r++) { heights[r] = S(_cfg.SlotHeight); minimumHeights[r] = S(80); }
+            for (int c = 0; c < columns; c++) minimumWidths[c] = S(80);
+            for (int r = 0; r < rows; r++) minimumHeights[r] = S(80);
             for (int i = 0; i < _slots.Count; i++)
             {
                 int column = i % columns, row = i / columns;
@@ -110,11 +110,12 @@ namespace WindowDock
                 }
                 minimumWidths[column] = Math.Max(minimumWidths[column], minWidth);
                 minimumHeights[row] = Math.Max(minimumHeights[row], minHeight);
-                widths[column] = Math.Max(widths[column], minimumWidths[column]);
-                heights[row] = Math.Max(heights[row], minimumHeights[row]);
             }
             int availableWidth = work.Width - 2 * margin - (vertical ? rail : 0) - (columns - 1) * gap;
             int availableHeight = work.Height - 2 * margin - (vertical ? 0 : rail) - header - headerGap - (rows - 1) * gap;
+            // 配置尺寸作为上限，屏幕放不下时按窗口最小尺寸收缩，不主动铺满。
+            for (int c = 0; c < columns; c++) widths[c] = Math.Max(S(_cfg.SlotWidth), minimumWidths[c]);
+            for (int r = 0; r < rows; r++) heights[r] = Math.Max(S(_cfg.SlotHeight), minimumHeights[r]);
             FitTracks(widths, minimumWidths, availableWidth);
             FitTracks(heights, minimumHeights, availableHeight);
             int contentWidth = Sum(widths) + (columns - 1) * gap;

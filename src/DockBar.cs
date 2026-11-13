@@ -22,6 +22,9 @@ namespace WindowDock
         public Native.WINDOWPLACEMENT OriginalPlacement;
         public bool HiddenByUs;
         public int InvisibleTicks;
+        public int LastForceShowTick;
+        public int RestoreGraceUntil;
+        public bool Unread;
         public HashSet<IntPtr> ExistingWindows = new HashSet<IntPtr>();
 
         public void ClearBinding()
@@ -33,6 +36,9 @@ namespace WindowDock
             OriginalPlacementValid = false;
             HiddenByUs = false;
             InvisibleTicks = 0;
+            LastForceShowTick = 0;
+            RestoreGraceUntil = 0;
+            Unread = false;
             ExistingWindows.Clear();
         }
     }
@@ -45,6 +51,9 @@ namespace WindowDock
         public uint ThreadId;
         public bool OriginalTopmost;
         public bool HiddenByUs;
+        // 无 owner 的工具窗口（消息提醒、悬浮面板等）只负责置顶，不随停靠栏隐藏/恢复，
+        // 否则会把刚好弹出的通知立刻藏掉，恢复时还可能把已过期的提醒重新弹出来。
+        public bool Transient;
 
         public bool IsValid
         {
@@ -108,7 +117,7 @@ namespace WindowDock
         private bool _startHidden;
         private UiHangMonitor _hangMonitor;
         private int _lastLayoutTick;
-        private bool _refreshRegionAfterShow;
+        private string _regionSignature;
         private bool _hotkeyRegistered;
         private bool _suspendAutoHide;
         private Form _activeDialog;
@@ -117,12 +126,16 @@ namespace WindowDock
         private int _hoverIndex = -1;
         private int _dragSlot = -1;
         private int _rebindCounter;
+        private bool _relayoutPending;
         private float _scale = 1f;
         private IntPtr _preShowForeground = IntPtr.Zero;
 
         private Timer _uiTimer;
         private Timer _enforceTimer;
         private NotifyIcon _tray;
+        private Icon _trayBaseIcon;
+        private Icon _trayUnreadIcon;
+        private IntPtr _trayUnreadHandle = IntPtr.Zero;
         private ContextMenuStrip _barMenu;
         private ContextMenuStrip _trayMenu;
         private ToolTip _tip;
@@ -203,6 +216,9 @@ namespace WindowDock
             _enforceTimer.Interval = 1000;
             _enforceTimer.Tick += EnforceTick;
             _hangMonitor = new UiHangMonitor(YswLog);
+
+            // WM_DISPLAYCHANGE 之外再兜底监听：远程桌面/虚拟机切换分辨率时有时只触发系统事件。
+            Microsoft.Win32.SystemEvents.DisplaySettingsChanged += OnDisplaySettingsChanged;
         }
 
         public List<SlotState> Slots
@@ -484,7 +500,6 @@ namespace WindowDock
             _initialized = true;
             YswLog("OnShown");
             _visible = true;
-            _refreshRegionAfterShow = true;
             AutoBindSlots();
             ComputeLayout();
             SetBounds(_panelRect.X, _panelRect.Y, _panelRect.Width, _panelRect.Height);
@@ -549,16 +564,7 @@ namespace WindowDock
             if (m.Msg == WM_DISPLAYCHANGE || m.Msg == WM_DPICHANGED)
             {
                 ResetSlotMeasurements();
-                try
-                {
-                    BeginInvoke(new MethodInvoker(delegate
-                    {
-                        RelayoutVisible();
-                    }));
-                }
-                catch (Exception)
-                {
-                }
+                ScheduleRelayout(m.Msg == WM_DPICHANGED ? "DPICHANGED" : "DISPLAYCHANGE");
                 if (m.Msg == WM_DPICHANGED) return;
             }
             if (m.Msg == WM_CONTEXTMENU && m.WParam == Handle)
@@ -640,7 +646,6 @@ namespace WindowDock
 
             base.Show();
             _visible = true;
-            _refreshRegionAfterShow = true;
 
             foreach (SlotState s in _slots)
             {
@@ -650,7 +655,21 @@ namespace WindowDock
                     s.HiddenByUs = false;
                 }
             }
+            foreach (SlotState s in _slots)
+            {
+                if (s.Hwnd == IntPtr.Zero || !Native.IsWindow(s.Hwnd)) continue;
+                if (Native.IsWindowVisible(s.Hwnd)) continue;
+                // 应用自己隐藏了窗口（会议中、收起到托盘等）。打开工具栏时立即尝试恢复，
+                // 否则槽位只剩深色背景，看起来就是黑屏；仍受限流，避免与应用反复拉锯。
+                if (unchecked(Environment.TickCount - s.LastForceShowTick) <= 30000) continue;
+                s.LastForceShowTick = Environment.TickCount;
+                s.RestoreGraceUntil = Environment.TickCount + 1500;
+                Native.ShowWindow(s.Hwnd, Native.SW_SHOWNOACTIVATE);
+            }
             LayoutDocked(true);
+            // 槽位窗口显示后立即刷新窗口区域挖孔；否则区域要等到 150ms 的弹层扫描才更新，
+            // 这期间不透明的工具栏背景会盖住槽位，看起来就是黑屏。
+            UpdateWindowRegion();
             RestoreHiddenPopups();
             RaisePopupsAboveDocked();
             _taskList.Invalidate();
@@ -685,7 +704,6 @@ namespace WindowDock
 
             Hide();
             _visible = false;
-            _refreshRegionAfterShow = false;
             _leaveMs = 0;
             _edgeDwellMs = 0;
 
@@ -751,6 +769,12 @@ namespace WindowDock
         {
             if (_exiting || !_initialized) return;
 
+            // 跨线程的 ShowWindow 是异步生效的，槽位真正可见前算出的挖孔区域会漏掉它，
+            // 工具栏背景就会一直盖在槽位上（黑屏）。每帧按签名自检并修复，50ms 内收敛。
+            // 必须放在下面的早退分支之前：编辑任务或弹出对话框时 UiTick 会提前返回，
+            // 若恰好在恢复缓冲期结束后走到这里，区域会一直停在不挖孔的状态。
+            if (_visible) UpdateWindowRegion();
+
             if (HasManagedDialog)
             {
                 EnsureManagedDialogAboveWindows();
@@ -760,18 +784,7 @@ namespace WindowDock
 
             _popupScanMs += _uiTimer.Interval;
             bool scanPopups = _popupScanMs >= 150;
-            if (scanPopups)
-            {
-                _popupScanMs = 0;
-                if (_visible && _refreshRegionAfterShow)
-                {
-                    UpdateWindowRegion();
-                    _refreshRegionAfterShow = false;
-                    foreach (SlotState slot in _slots)
-                        if (slot.Hwnd != IntPtr.Zero && Native.IsWindow(slot.Hwnd) && !Native.IsWindowVisible(slot.Hwnd))
-                            _refreshRegionAfterShow = true;
-                }
-            }
+            if (scanPopups) _popupScanMs = 0;
 
             if (IsEditingTasks)
             {
@@ -807,6 +820,7 @@ namespace WindowDock
             TrackDockedDrag();
             EnsureDockedAboveBar();
             RaisePopupsAboveDocked();
+            ClearUnreadForForeground(Native.GetForegroundWindow());
 
             if (!_cfg.AutoHide || _suspendAutoHide)
             {
@@ -955,7 +969,23 @@ namespace WindowDock
                 }
             }
 
-            if (!_visible) return;
+            if (!_visible)
+            {
+                // 应用自己重新显示了窗口（典型场景：收到新消息时弹出提醒窗口），
+                // 跟随应用把停靠栏显示出来，避免提醒窗口孤立地浮在桌面或根本看不到。
+                IntPtr fg = Native.GetForegroundWindow();
+                foreach (SlotState s in _slots)
+                {
+                    if (s.Hwnd == IntPtr.Zero || !s.HiddenByUs) continue;
+                    if (!Native.IsWindow(s.Hwnd) || !Native.IsWindowVisible(s.Hwnd)) continue;
+                    // 只接管应用到前台的显示行为；后台周期性自显不应反复拉起停靠栏。
+                    if (fg != IntPtr.Zero && Native.GetAncestor(fg, Native.GA_ROOT) != s.Hwnd) continue;
+                    YswLog("app self-show hwnd=" + s.Hwnd + " -> ShowDock");
+                    ShowDock();
+                    return;
+                }
+                return;
+            }
 
             if (_cfg.AllowSlotExpand && unchecked(Environment.TickCount - _lastLayoutTick) >= 500 &&
                 MeasureSlotMinimums(true))
@@ -975,10 +1005,22 @@ namespace WindowDock
                 if (!Native.IsWindowVisible(h))
                 {
                     if (!Native.IsWindowResponsive(h)) continue;
-                    // 应用自行隐藏了绑定的窗口（常见于 Qt/Electron 的临时弹层），
-                    // 持续几秒仍不可见时尝试改绑到同进程的可见主窗口，避免槽位长期空白。
+                    // 应用自行隐藏了绑定的窗口（关闭到托盘、临时弹层切换等）。先尝试重新
+                    // 显示并放回槽位，避免槽位只剩工具栏背景（看起来就是黑屏）；仍不可见
+                    // 时再改绑到同进程的可见主窗口。
                     s.InvisibleTicks++;
-                    if (s.InvisibleTicks == 1) UpdateWindowRegion();
+                    // 30 秒内只强制显示一次，避免与应用“关闭到托盘”的隐藏行为反复拉锯。
+                    if (s.InvisibleTicks == 1 &&
+                        unchecked(Environment.TickCount - s.LastForceShowTick) > 30000)
+                    {
+                        s.LastForceShowTick = Environment.TickCount;
+                        s.RestoreGraceUntil = Environment.TickCount + 1500;
+                        Rectangle r = _slotRects[i];
+                        Native.ShowWindow(h, Native.SW_SHOWNOACTIVATE);
+                        Native.SetWindowPos(h, IntPtr.Zero, r.X, r.Y, r.Width, r.Height,
+                            Native.SWP_NOZORDER | Native.SWP_NOACTIVATE | Native.SWP_NOOWNERZORDER);
+                        UpdateWindowRegion();
+                    }
                     if (s.InvisibleTicks >= 2) TryRebindInvisibleSlot(i, s);
                     continue;
                 }
@@ -1091,6 +1133,9 @@ namespace WindowDock
             int availW = vertical ? wa.Width - rail - 2 * margin : wa.Width - 2 * margin;
             int gapTotal = n > 1 ? (n - 1) * gap : 0;
 
+            int maxContent = availW - gapTotal;
+            if (maxContent < floorW) maxContent = floorW;
+
             int[] widths = new int[n];
             int total = 0;
             for (int i = 0; i < n; i++)
@@ -1098,9 +1143,6 @@ namespace WindowDock
                 widths[i] = Math.Max(nominalW, SlotMinWAt(i));
                 total += widths[i];
             }
-
-            int maxContent = availW - gapTotal;
-            if (maxContent < floorW) maxContent = floorW;
 
             if (n > 0 && total > maxContent)
             {
@@ -1161,8 +1203,7 @@ namespace WindowDock
             int slotH = S(_cfg.SlotHeight);
             if (slotH > availH) slotH = availH;
             if (slotH < S(160)) slotH = availH >= S(160) ? S(160) : Math.Max(S(80), availH);
-            if (_cfg.AllowSlotExpand && _slotMinH > slotH)
-                slotH = _slotMinH;
+            if (_cfg.AllowSlotExpand && _slotMinH > slotH) slotH = _slotMinH;
             if (slotH > availH) slotH = Math.Max(S(80), availH);
 
             int panelW = (vertical ? rail + 2 * margin : 2 * margin) + contentW;
@@ -1453,11 +1494,17 @@ namespace WindowDock
         {
             if (index < 0 || index >= _slots.Count) return;
             SlotState s = _slots[index];
+            bool hadUnread = s.Unread;
             RestoreSlotWindow(s);
             s.ClearBinding();
             SetSlotMinW(index, 0);
             _slotMinHeights[index] = 0;
             _slotMinH = 0;
+            if (hadUnread)
+            {
+                UpdateTrayStatus();
+                Invalidate();
+            }
             if (save)
             {
                 s.ProcessName = "";
@@ -1567,35 +1614,81 @@ namespace WindowDock
             return changed;
         }
 
+        // 刚被强制显示的窗口需要一小段重绘时间；期间保持槽位由工具栏绘制，避免露出空白画面。
+        private static bool IsRestoring(SlotState s)
+        {
+            return s.RestoreGraceUntil != 0 &&
+                unchecked(s.RestoreGraceUntil - Environment.TickCount) > 0;
+        }
+
+        // 返回 true 表示槽位当前需要由工具栏自己绘制（窗口不可见或仍在恢复中）。
+        private static bool SlotNeedsPlaceholder(SlotState s)
+        {
+            if (s.Hwnd == IntPtr.Zero || !Native.IsWindow(s.Hwnd)) return false;
+            return !Native.IsWindowVisible(s.Hwnd) || Native.IsIconic(s.Hwnd) || IsRestoring(s);
+        }
+
         private void UpdateWindowRegion()
         {
             // 把已停靠且可见的槽位从本窗体区域里挖掉。这样即使工具栏被激活抬到置顶带最上层，
             // 也无法再盖住槽位（黑屏的根因），窗口区域的命中测试同样会直接落到停靠窗口上。
             if (!IsHandleCreated || _panelRect.Width <= 0 || _panelRect.Height <= 0) return;
+            StringBuilder sig = new StringBuilder();
+            sig.Append(Width).Append('x').Append(Height).Append("|");
+            for (int i = 0; i < _slots.Count && i < _slotRects.Length; i++)
+            {
+                SlotState s = _slots[i];
+                Rectangle r = _slotRects[i];
+                sig.Append(s.Hwnd).Append(':');
+                if (s.Hwnd == IntPtr.Zero || !Native.IsWindow(s.Hwnd)) sig.Append('x');
+                else if (SlotNeedsPlaceholder(s)) sig.Append('0');
+                else sig.Append('1');
+                sig.Append(':').Append(r.X).Append(',').Append(r.Y).Append(',')
+                    .Append(r.Width).Append(',').Append(r.Height).Append(';');
+            }
+            string signature = sig.ToString();
+            if (signature == _regionSignature) return;
             try
             {
+                bool applied = false;
+                int cuts = 0;
                 using (Region region = new Region(new Rectangle(0, 0, Width, Height)))
                 {
                     for (int i = 0; i < _slots.Count && i < _slotRects.Length; i++)
                     {
                         SlotState s = _slots[i];
                         if (s.Hwnd == IntPtr.Zero || !Native.IsWindow(s.Hwnd)) continue;
-                        if (!Native.IsWindowVisible(s.Hwnd) || Native.IsIconic(s.Hwnd)) continue;
+                        // 恢复缓冲期内保留工具栏绘制，等窗口重绘完成后再挖孔露出。
+                        if (SlotNeedsPlaceholder(s)) continue;
                         Rectangle r = _slotRects[i];
                         region.Exclude(new Rectangle(r.X - _panelRect.X, r.Y - _panelRect.Y,
                             r.Width, r.Height));
+                        cuts++;
                     }
                     using (Graphics g = CreateGraphics())
                     {
                         IntPtr hrgn = region.GetHrgn(g);
                         // SetWindowRgn 成功后由系统接管 HRGN，不能再删除。
                         if (Native.SetWindowRgn(Handle, hrgn, true) == 0)
+                        {
                             Native.DeleteObject(hrgn);
+                            YswLog("SetWindowRgn failed");
+                        }
+                        else
+                        {
+                            applied = true;
+                        }
                     }
+                }
+                if (applied)
+                {
+                    _regionSignature = signature;
+                    YswLog("region apply cuts=" + cuts + " sig=" + signature);
                 }
             }
             catch (Exception)
             {
+                _regionSignature = null;
             }
         }
 
@@ -1786,6 +1879,13 @@ namespace WindowDock
 
         private void RelayoutVisible()
         {
+            _relayoutPending = false;
+            Screen[] screens = Screen.AllScreens;
+            if (screens.Length > 0 && (_cfg.MonitorIndex < 0 || _cfg.MonitorIndex >= screens.Length))
+            {
+                _cfg.MonitorIndex = 0;
+                SaveConfig();
+            }
             ComputeLayout();
             if (_visible)
             {
@@ -1793,6 +1893,29 @@ namespace WindowDock
                 LayoutDocked(true);
             }
             Invalidate();
+        }
+
+        // 分辨率/DPI/显示器变化可能连续触发多条系统消息，合并成一次重排。
+        private void ScheduleRelayout(string reason)
+        {
+            if (!IsHandleCreated || _relayoutPending) return;
+            _relayoutPending = true;
+            YswLog("display change -> relayout: " + reason);
+            try
+            {
+                BeginInvoke(new MethodInvoker(RelayoutVisible));
+            }
+            catch (Exception)
+            {
+                _relayoutPending = false;
+            }
+        }
+
+        private void OnDisplaySettingsChanged(object sender, EventArgs e)
+        {
+            if (!IsHandleCreated || IsDisposed) return;
+            try { BeginInvoke(new MethodInvoker(delegate { ScheduleRelayout("SystemEvents"); })); }
+            catch (Exception) { }
         }
 
         public void ApplySettings(Settings newCfg)
@@ -2078,6 +2201,40 @@ namespace WindowDock
             return -1;
         }
 
+        private int HitHiddenSlot(Point p)
+        {
+            for (int i = 0; i < _slots.Count && i < _slotRects.Length; i++)
+            {
+                SlotState s = _slots[i];
+                if (!SlotNeedsPlaceholder(s)) continue;
+                if (RectToClient(_slotRects[i]).Contains(p)) return i;
+            }
+            return -1;
+        }
+
+        private void RestoreHiddenSlot(int index)
+        {
+            SlotState s = _slots[index];
+            if (s.Hwnd == IntPtr.Zero || !Native.IsWindow(s.Hwnd)) return;
+            s.LastForceShowTick = Environment.TickCount;
+            s.RestoreGraceUntil = Environment.TickCount + 1500;
+            if (!Native.IsWindowVisible(s.Hwnd) || Native.IsIconic(s.Hwnd))
+            {
+                if (Native.IsIconic(s.Hwnd)) Native.ShowWindow(s.Hwnd, Native.SW_RESTORE);
+                else Native.ShowWindow(s.Hwnd, Native.SW_SHOWNOACTIVATE);
+            }
+            else
+            {
+                // 窗口可见但仍停留在恢复提示上时，点击直接把它切到前台，促使应用立即重绘。
+                Native.SetForegroundWindow(s.Hwnd);
+            }
+            s.HiddenByUs = false;
+            s.InvisibleTicks = 0;
+            LayoutDocked(true);
+            UpdateWindowRegion();
+            Invalidate();
+        }
+
         private int HitSlot(Point p)
         {
             for (int i = 0; i < _slots.Count && i < _slotRects.Length; i++)
@@ -2174,7 +2331,7 @@ namespace WindowDock
                 Invalidate();
             }
 
-            if (hover >= 0 || HitEmptySlot(e.Location) >= 0)
+            if (hover >= 0 || HitEmptySlot(e.Location) >= 0 || HitUnreadBadge(e.Location) >= 0)
                 Cursor = Cursors.Hand;
             else
                 Cursor = Cursors.Default;
@@ -2201,6 +2358,20 @@ namespace WindowDock
             if (b >= 0)
             {
                 DoAction(_buttons[b].Action);
+                return;
+            }
+
+            int badge = HitUnreadBadge(e.Location);
+            if (badge >= 0)
+            {
+                SetSlotUnread(badge, false);
+                return;
+            }
+
+            int hiddenSlot = HitHiddenSlot(e.Location);
+            if (hiddenSlot >= 0)
+            {
+                RestoreHiddenSlot(hiddenSlot);
                 return;
             }
 
@@ -2262,6 +2433,88 @@ namespace WindowDock
             }
         }
 
+        private Rectangle UnreadBadgeRect(int index)
+        {
+            Rectangle r = RectToClient(_slotRects[index]);
+            int d = S(12);
+            return new Rectangle(r.Right - d - S(2), r.Top - d - S(2), d, d);
+        }
+
+        private int HitUnreadBadge(Point point)
+        {
+            for (int i = 0; i < _slots.Count && i < _slotRects.Length; i++)
+                if (_slots[i].Unread && UnreadBadgeRect(i).Contains(point)) return i;
+            return -1;
+        }
+
+        private void SetSlotUnread(int index, bool unread)
+        {
+            if (index < 0 || index >= _slots.Count) return;
+            SlotState s = _slots[index];
+            if (s.Unread == unread) return;
+            s.Unread = unread;
+            YswLog("slot " + (unread ? "unread" : "read") + " index=" + index);
+            UpdateTrayStatus();
+            Invalidate();
+        }
+
+        private void UpdateTrayStatus()
+        {
+            if (_tray == null) return;
+            if (_trayBaseIcon == null) _trayBaseIcon = Icon != null ? Icon : SystemIcons.Application;
+            List<string> unread = new List<string>();
+            for (int i = 0; i < _slots.Count; i++)
+            {
+                SlotState s = _slots[i];
+                if (!s.Unread) continue;
+                string name = s.ProcessName;
+                if (name.EndsWith(".exe", StringComparison.OrdinalIgnoreCase))
+                    name = name.Substring(0, name.Length - 4);
+                if (name.Length == 0) name = s.TitleHint;
+                if (name.Length == 0) name = "槽位 " + (i + 1);
+                unread.Add(name);
+            }
+            if (unread.Count == 0)
+            {
+                _tray.Icon = _trayBaseIcon;
+                _tray.Text = "WindowDock 窗口停靠栏";
+                return;
+            }
+            if (_trayUnreadIcon == null) _trayUnreadIcon = BuildUnreadTrayIcon();
+            _tray.Icon = _trayUnreadIcon != null ? _trayUnreadIcon : _trayBaseIcon;
+            string text = "WindowDock - 未读消息：" + string.Join("、", unread.ToArray());
+            _tray.Text = text.Length > 63 ? text.Substring(0, 63) : text;
+        }
+
+        private Icon BuildUnreadTrayIcon()
+        {
+            try
+            {
+                Size size = SystemInformation.SmallIconSize;
+                if (size.Width <= 0 || size.Height <= 0) size = new Size(16, 16);
+                using (Bitmap bmp = new Bitmap(size.Width, size.Height))
+                {
+                    using (Graphics g = Graphics.FromImage(bmp))
+                    {
+                        g.SmoothingMode = SmoothingMode.AntiAlias;
+                        if (_trayBaseIcon != null) g.DrawIcon(_trayBaseIcon, new Rectangle(Point.Empty, size));
+                        int d = Math.Max(6, size.Width / 2);
+                        Rectangle dot = new Rectangle(size.Width - d, size.Height - d, d - 1, d - 1);
+                        using (SolidBrush fill = new SolidBrush(Color.FromArgb(255, 196, 0)))
+                            g.FillEllipse(fill, dot);
+                        using (Pen edge = new Pen(Color.FromArgb(35, 32, 26), 1f))
+                            g.DrawEllipse(edge, dot);
+                    }
+                    _trayUnreadHandle = bmp.GetHicon();
+                    return Icon.FromHandle(_trayUnreadHandle);
+                }
+            }
+            catch (Exception)
+            {
+                return null;
+            }
+        }
+
         protected override void OnPaint(PaintEventArgs e)
         {
             Graphics g = e.Graphics;
@@ -2317,6 +2570,26 @@ namespace WindowDock
                     {
                         Rectangle b = Rectangle.Inflate(r, S(2), S(2));
                         g.DrawRectangle(bp, b.Left, b.Top, b.Width - 1, b.Height - 1);
+                    }
+                    if (s.Unread)
+                    {
+                        Rectangle badge = UnreadBadgeRect(i);
+                        using (SolidBrush fill = new SolidBrush(Color.FromArgb(255, 196, 0)))
+                            g.FillEllipse(fill, badge);
+                        using (Pen edge = new Pen(Color.FromArgb(40, 34, 22), Math.Max(1f, 1f * _scale)))
+                            g.DrawEllipse(edge, badge);
+                    }
+                    if (SlotNeedsPlaceholder(s))
+                    {
+                        // 应用把绑定窗口藏起来了，或刚恢复还没重绘。不绘制提示时槽位只剩下
+                        // 工具栏背景，看起来像黑屏。
+                        Rectangle nameRect = new Rectangle(r.Left, r.Top + r.Height / 2 - S(26), r.Width, S(26));
+                        using (SolidBrush nameBrush = new SolidBrush(ThemeText(Color.FromArgb(205, 211, 222))))
+                            DrawCenteredString(g, s.ProcessName, _slotTitleFont, nameBrush, nameRect);
+                        Rectangle hiddenRect = new Rectangle(r.Left, r.Top + r.Height / 2 + S(6), r.Width, S(22));
+                        using (SolidBrush hiddenBrush = new SolidBrush(ThemeText(Color.FromArgb(140, 148, 162))))
+                            DrawCenteredString(g, IsRestoring(s) ? "正在恢复窗口…" : "窗口已隐藏，点击恢复",
+                                _slotHintFont, hiddenBrush, hiddenRect);
                     }
                     continue;
                 }
@@ -2396,6 +2669,8 @@ namespace WindowDock
             if (_cleaned) return;
             _cleaned = true;
 
+            Microsoft.Win32.SystemEvents.DisplaySettingsChanged -= OnDisplaySettingsChanged;
+
             try
             {
                 if (_hotkeyRegistered)
@@ -2429,6 +2704,16 @@ namespace WindowDock
                 _tray.Visible = false;
                 _tray.Dispose();
                 _tray = null;
+            }
+            if (_trayUnreadIcon != null)
+            {
+                _trayUnreadIcon.Dispose();
+                _trayUnreadIcon = null;
+            }
+            if (_trayUnreadHandle != IntPtr.Zero)
+            {
+                Native.DestroyIcon(_trayUnreadHandle);
+                _trayUnreadHandle = IntPtr.Zero;
             }
             if (_tip != null)
             {
