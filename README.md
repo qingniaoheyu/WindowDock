@@ -4,9 +4,11 @@ Windows 桌面窗口停靠栏，可将多个应用窗口排列在屏幕边缘，
 
 ## 下载
 
-[下载 v1.0.0（Windows x64 ZIP）](https://github.com/qingniaoheyu/WindowDock/releases/download/v1.0.0/WindowDock-v1.0.0-win-x64.zip)，解压后双击 `WindowDock.exe` 即可运行，无需安装。适用于 Windows 10/11 x64，需要 .NET Framework 4.x 运行环境。
+**最新版请到下载页：<https://qingniaoheyu.github.io/WindowDock/>**（自动展示最新 Release 的 EXE、ZIP 与 SHA-256 校验值）。
 
-[Release 页面](https://github.com/qingniaoheyu/WindowDock/releases/tag/v1.0.0)同时提供独立 EXE 和 `SHA256SUMS.txt` 校验文件。
+也可以直接打开 [Releases 页面](https://github.com/qingniaoheyu/WindowDock/releases/latest)。解压 ZIP 后双击 `WindowDock.exe` 即可运行，无需安装。适用于 Windows 10/11 x64，需要 .NET Framework 4.x 运行环境。每个 Release 同时提供独立 EXE 和 `SHA256SUMS.txt` 校验文件。
+
+版本由仓库根目录的 `VERSION` 文件决定。推送到 `main` 且改动涉及 `src/`、`assets/`、`build.ps1`、`tools/publish.ps1`、`VERSION` 或 workflow 自身时，`.github/workflows/release.yml` 会自动编译并发布对应版本的 Release；也可在 Actions 里手动触发并指定版本号。
 
 ## 界面截图
 
