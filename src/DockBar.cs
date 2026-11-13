@@ -111,6 +111,7 @@ namespace WindowDock
         private bool _refreshRegionAfterShow;
         private bool _hotkeyRegistered;
         private bool _suspendAutoHide;
+        private Form _activeDialog;
         private int _edgeDwellMs;
         private int _leaveMs;
         private int _hoverIndex = -1;
@@ -407,23 +408,16 @@ namespace WindowDock
         {
             if (index < 0 || index >= _cfg.Tasks.Count) return;
             TaskItem task = _cfg.Tasks[index];
-            bool suspended = _suspendAutoHide;
-            _suspendAutoHide = true;
-            try
+            using (TaskDeadlineForm dialog = new TaskDeadlineForm(task))
             {
-                using (TaskDeadlineForm dialog = new TaskDeadlineForm(task))
+                if (ShowManagedDialog(dialog) == DialogResult.OK)
                 {
-                    dialog.TopMost = _cfg.AlwaysOnTop;
-                    if (dialog.ShowDialog(this) == DialogResult.OK)
-                    {
-                        task.Deadline = dialog.Deadline;
-                        if (_editingTask == index) SetTaskDeadline(task.Deadline);
-                        _taskList.Invalidate();
-                        SaveConfig();
-                    }
+                    task.Deadline = dialog.Deadline;
+                    if (_editingTask == index) SetTaskDeadline(task.Deadline);
+                    _taskList.Invalidate();
+                    SaveConfig();
                 }
             }
-            finally { _suspendAutoHide = suspended; _leaveMs = 0; }
         }
 
         private void ResetTaskEditor()
@@ -757,6 +751,13 @@ namespace WindowDock
         {
             if (_exiting || !_initialized) return;
 
+            if (HasManagedDialog)
+            {
+                EnsureManagedDialogAboveWindows();
+                _leaveMs = 0;
+                return;
+            }
+
             _popupScanMs += _uiTimer.Interval;
             bool scanPopups = _popupScanMs >= 150;
             if (scanPopups)
@@ -919,6 +920,7 @@ namespace WindowDock
         {
             if (_exiting) return;
             if (_visible && _cfg.TasksVisible) _taskList.Invalidate();
+            if (HasManagedDialog) { EnsureManagedDialogAboveWindows(); return; }
             if (IsEditingTasks) return;
 
             bool changed = false;
@@ -1599,6 +1601,7 @@ namespace WindowDock
 
         private void LayoutDockedCore(bool setZOrder)
         {
+            if (HasManagedDialog) setZOrder = false;
             for (int i = 0; i < _slots.Count && i < _slotRects.Length; i++)
             {
                 SlotState s = _slots[i];
@@ -1640,7 +1643,7 @@ namespace WindowDock
 
         private void RaiseDockedAboveBar()
         {
-            if (!_visible) return;
+            if (!_visible || HasManagedDialog) return;
             IntPtr after = _cfg.AlwaysOnTop ? Native.HWND_TOPMOST : Native.HWND_TOP;
             for (int i = 0; i < _slots.Count; i++)
             {
@@ -1655,6 +1658,7 @@ namespace WindowDock
 
         private void EnsureDockedAboveBar()
         {
+            if (HasManagedDialog) return;
             // 点击工具栏会让它在置顶带内被抬到停靠窗口之上，这个时序无法只靠 WM_ACTIVATE 保证。
             // 每 50ms 用 WindowFromPoint 检查槽位中心是否被本窗体盖住，被盖住才把该窗口重新抬高。
             for (int i = 0; i < _slots.Count && i < _slotRects.Length; i++)
@@ -1930,58 +1934,77 @@ namespace WindowDock
             return false;
         }
 
-        public void OpenSlotsDialog()
+        private bool HasManagedDialog
         {
+            get { return _activeDialog != null && !_activeDialog.IsDisposed; }
+        }
+
+        private void EnsureManagedDialogAboveWindows()
+        {
+            Form dialog = _activeDialog;
+            if (dialog == null || dialog.IsDisposed || !dialog.Visible || !dialog.IsHandleCreated) return;
+            HashSet<IntPtr> seen = new HashSet<IntPtr>();
+            for (IntPtr above = Native.GetWindow(dialog.Handle, Native.GW_HWNDPREV);
+                above != IntPtr.Zero && seen.Add(above); above = Native.GetWindow(above, Native.GW_HWNDPREV))
+            {
+                if (Native.IsWindowVisible(above) && (above == Handle || IsDockedWindow(above)))
+                {
+                    Native.SetWindowPos(dialog.Handle, Native.HWND_TOPMOST, 0, 0, 0, 0,
+                        Native.SWP_NOMOVE | Native.SWP_NOSIZE | Native.SWP_NOACTIVATE | Native.SWP_NOOWNERZORDER);
+                    break;
+                }
+            }
+        }
+
+        internal DialogResult ShowManagedDialog(Form dialog)
+        {
+            Form previousDialog = _activeDialog;
+            bool previousSuspend = _suspendAutoHide;
+            _activeDialog = dialog;
             _suspendAutoHide = true;
+            // 即使全局关闭置顶，应用原本置顶的窗口也不能盖住自己的设置对话框。
+            dialog.TopMost = true;
+            EventHandler shown = delegate
+            {
+                Native.SetWindowPos(dialog.Handle, Native.HWND_TOPMOST, 0, 0, 0, 0,
+                    Native.SWP_NOMOVE | Native.SWP_NOSIZE | Native.SWP_NOACTIVATE | Native.SWP_NOOWNERZORDER);
+                dialog.Activate();
+                YswLog("managed dialog shown: " + dialog.Text);
+            };
+            dialog.Shown += shown;
             try
             {
-                using (SlotsForm f = new SlotsForm(this))
-                {
-                    f.ShowDialog(this);
-                }
+                return dialog.ShowDialog(previousDialog != null && !previousDialog.IsDisposed ? previousDialog : this);
             }
             finally
             {
-                _suspendAutoHide = false;
+                dialog.Shown -= shown;
+                _activeDialog = previousDialog;
+                _suspendAutoHide = previousSuspend;
                 _leaveMs = 0;
+                if (HasManagedDialog) EnsureManagedDialogAboveWindows();
+                else if (_visible) RaiseDockedAboveBar();
             }
+        }
+
+        public void OpenSlotsDialog()
+        {
+            using (SlotsForm f = new SlotsForm(this)) ShowManagedDialog(f);
             Invalidate();
         }
 
         private void OpenSettingsDialog()
         {
-            _suspendAutoHide = true;
-            try
-            {
-                using (SettingsForm f = new SettingsForm(_cfg))
-                {
-                    if (f.ShowDialog(this) == DialogResult.OK)
-                        ApplySettings(f.Result);
-                }
-            }
-            finally
-            {
-                _suspendAutoHide = false;
-                _leaveMs = 0;
-            }
+            using (SettingsForm f = new SettingsForm(_cfg))
+                if (ShowManagedDialog(f) == DialogResult.OK) ApplySettings(f.Result);
         }
 
         private void OpenPickerForSlot(int index)
         {
-            _suspendAutoHide = true;
-            try
+            using (PickerForm f = new PickerForm())
             {
-                using (PickerForm f = new PickerForm())
-                {
-                    f.TopMost = _cfg.AlwaysOnTop;
-                    if (f.ShowDialog(this) == DialogResult.OK && f.SelectedHandle != IntPtr.Zero)
-                        BindSlot(index, f.SelectedHandle);
-                }
-            }
-            finally
-            {
-                _suspendAutoHide = false;
-                _leaveMs = 0;
+                if (ShowManagedDialog(f) == DialogResult.OK && f.SelectedHandle != IntPtr.Zero)
+                    BindSlot(index, f.SelectedHandle);
             }
             Invalidate();
         }

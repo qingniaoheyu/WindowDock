@@ -211,8 +211,7 @@ namespace WindowDock
 
             using (PickerForm f = new PickerForm())
             {
-                f.TopMost = TopMost;
-                if (f.ShowDialog(this) == DialogResult.OK && f.SelectedHandle != IntPtr.Zero)
+                if (_bar.ShowManagedDialog(f) == DialogResult.OK && f.SelectedHandle != IntPtr.Zero)
                     _bar.BindSlot(idx, f.SelectedHandle);
             }
             RefreshList(idx);

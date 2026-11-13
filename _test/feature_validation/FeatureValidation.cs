@@ -138,6 +138,123 @@ static class FeatureValidation
         }
     }
 
+    private static void ValidateDialogLayering(DockBar dock, IntPtr main, IntPtr preview, IntPtr independent)
+    {
+        int stage = 0;
+        using (System.Windows.Forms.Timer closer = new System.Windows.Forms.Timer())
+        {
+            closer.Interval = 60;
+            closer.Tick += delegate
+            {
+                SettingsForm settings = null;
+                foreach (Form form in Application.OpenForms)
+                    if (form is SettingsForm) settings = (SettingsForm)form;
+                if (settings == null) return;
+                closer.Stop();
+                if (stage == 0)
+                {
+                    Check(settings.TopMost && Topmost(settings.Handle), "Settings explicitly stays topmost with global topmost disabled");
+                    Check(Above(settings.Handle, main) && Above(settings.Handle, preview), "Settings opens above bound app and image preview");
+                    Check((bool)Field(dock, "_suspendAutoHide"), "Opening settings suspends auto hide");
+                    Native.SetWindowPos(main, Native.HWND_TOPMOST, 0, 0, 0, 0,
+                        Native.SWP_NOMOVE | Native.SWP_NOSIZE | Native.SWP_NOACTIVATE);
+                    Native.SetWindowPos(preview, Native.HWND_TOPMOST, 0, 0, 0, 0,
+                        Native.SWP_NOMOVE | Native.SWP_NOSIZE | Native.SWP_NOACTIVATE);
+                    stage = 1;
+                    closer.Interval = 300;
+                    closer.Start();
+                }
+                else if (stage == 1)
+                {
+                    Check(Above(settings.Handle, main) && Above(settings.Handle, preview), "Settings recovers above late external topmost requests");
+                    Call(dock, "RaiseDockedAboveBar");
+                    Call(dock, "EnsureDockedAboveBar");
+                    Call(dock, "RaisePopupsAboveDocked");
+                    Call(dock, "EnforceTickCore");
+                    Call(dock, "LayoutDocked", true);
+                    stage = 2;
+                    closer.Interval = 200;
+                    closer.Start();
+                }
+                else
+                {
+                    Check(Above(settings.Handle, main) && Above(settings.Handle, preview), "Background layout and raising cannot cover settings");
+                    settings.DialogResult = DialogResult.Cancel;
+                    settings.Close();
+                }
+            };
+            closer.Start();
+            Call(dock, "OpenSettingsDialog");
+            Pump(10);
+        }
+        Check(Field(dock, "_activeDialog") == null && !(bool)Field(dock, "_suspendAutoHide"), "Closing settings restores dialog and auto hide state");
+
+        Native.SetWindowPos(independent, Native.HWND_TOPMOST, 0, 0, 0, 0,
+            Native.SWP_NOMOVE | Native.SWP_NOSIZE | Native.SWP_NOACTIVATE);
+        Pump(100);
+        dock.HideDock();
+        using (System.Windows.Forms.Timer closer = new System.Windows.Forms.Timer())
+        {
+            closer.Interval = 150;
+            closer.Tick += delegate
+            {
+                SettingsForm settings = null;
+                foreach (Form form in Application.OpenForms)
+                    if (form is SettingsForm) settings = (SettingsForm)form;
+                if (settings == null) return;
+                closer.Stop();
+                Check(settings.Visible && Topmost(settings.Handle) && Above(settings.Handle, independent), "Settings from hidden tray opens above an existing topmost app");
+                Check(!dock.Visible, "Opening settings preserves hidden toolbar state");
+                settings.DialogResult = DialogResult.Cancel;
+                settings.Close();
+            };
+            closer.Start();
+            Call(dock, "OpenSettingsDialog");
+            Pump(10);
+        }
+        Native.SetWindowPos(independent, Native.HWND_NOTOPMOST, 0, 0, 0, 0,
+            Native.SWP_NOMOVE | Native.SWP_NOSIZE | Native.SWP_NOACTIVATE);
+        dock.ShowDock(); Pump(300);
+
+        stage = 0;
+        SlotsForm parent = null;
+        using (System.Windows.Forms.Timer closer = new System.Windows.Forms.Timer())
+        {
+            closer.Interval = 80;
+            closer.Tick += delegate
+            {
+                closer.Stop();
+                if (stage == 0)
+                {
+                    foreach (Form form in Application.OpenForms)
+                        if (form is SlotsForm) parent = (SlotsForm)form;
+                    if (parent == null) { closer.Start(); return; }
+                    Check(Topmost(parent.Handle), "Slot manager is topmost");
+                    stage = 1; closer.Start();
+                    Call(parent, "BindSelected");
+                    closer.Stop();
+                    Check(Field(dock, "_activeDialog") == parent && (bool)Field(dock, "_suspendAutoHide"), "Closing nested picker preserves parent dialog suspension");
+                    parent.DialogResult = DialogResult.Cancel;
+                    parent.Close();
+                }
+                else
+                {
+                    PickerForm picker = null;
+                    foreach (Form form in Application.OpenForms)
+                        if (form is PickerForm) picker = (PickerForm)form;
+                    if (picker == null) { closer.Start(); return; }
+                    Check(picker.Owner == parent && Topmost(picker.Handle) && Above(picker.Handle, parent.Handle), "Nested picker stays above its slot manager owner");
+                    picker.DialogResult = DialogResult.Cancel;
+                    picker.Close();
+                }
+            };
+            closer.Start();
+            dock.OpenSlotsDialog();
+            Pump(10);
+        }
+        Check(Field(dock, "_activeDialog") == null && !(bool)Field(dock, "_suspendAutoHide"), "Closing nested dialogs restores normal toolbar state");
+    }
+
     [STAThread]
     public static int Main()
     {
@@ -145,7 +262,14 @@ static class FeatureValidation
         Native.EnableDpiAwareness();
         Application.EnableVisualStyles();
         Application.SetCompatibleTextRenderingDefault(false);
-        Application.ThreadException += delegate(object sender, ThreadExceptionEventArgs args) { _uiError = args.Exception; };
+        Application.ThreadException += delegate(object sender, ThreadExceptionEventArgs args)
+        {
+            _uiError = args.Exception;
+            System.Collections.Generic.List<Form> forms = new System.Collections.Generic.List<Form>();
+            foreach (Form form in Application.OpenForms) if (form.Modal) forms.Add(form);
+            forms.Reverse();
+            foreach (Form form in forms) { form.DialogResult = DialogResult.Cancel; form.Close(); }
+        };
         Process previewHost = null;
         DockBar dock = null;
         try
@@ -305,6 +429,7 @@ static class FeatureValidation
             dock.ApplySettings(topOff);
             Pump(200);
             Check(!Topmost(main) && !Topmost(ownerless), "Turning off topmost restores main and ownerless preview stacking");
+            ValidateDialogLayering(dock, main, owned, independent);
             dock.HideDock();
             Pump(100);
             dock.UnbindSlot(0, true);

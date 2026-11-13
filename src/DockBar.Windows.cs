@@ -154,7 +154,7 @@ namespace WindowDock
 
         private void RaisePopupsAboveDocked()
         {
-            if (!_visible || _popups.Count == 0) return;
+            if (!_visible || _popups.Count == 0 || HasManagedDialog) return;
             IntPtr foreground = Native.GetForegroundWindow();
             if (_suspendAutoHide && foreground != Handle && IsOwnWindow(foreground)) return;
             HashSet<IntPtr> docked = new HashSet<IntPtr>();
@@ -191,6 +191,7 @@ namespace WindowDock
 
         private void ApplyPopupTopmost()
         {
+            if (HasManagedDialog) return;
             foreach (PopupState popup in _popups.Values)
                 if (popup.IsValid)
                     Native.SetWindowPos(popup.Hwnd,
