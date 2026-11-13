@@ -1,5 +1,6 @@
 # Local builds and personal settings
 dist/
+artifacts/
 *.exe
 *.pdb
 *.ini
@@ -7,6 +8,8 @@ dist/
 *.bak
 *.dmp
 *.tmp
+*.zip
+SHA256SUMS.txt
 
 # Keep only the portable regression test sources and runners
 _probe/

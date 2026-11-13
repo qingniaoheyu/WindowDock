@@ -1,0 +1,190 @@
+name: Build and publish release
+
+# 有更新即构建：推送到 main、改 VERSION / 源码 / 构建脚本，或手动触发。
+# 每次成功构建都会产出 WindowDock.exe、ZIP 和 SHA256SUMS.txt，
+# 并发布（或更新）对应版本的 GitHub Release；GitHub Pages 下载页会自动读取最新 Release。
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'src/**'
+      - 'assets/**'
+      - 'build.ps1'
+      - 'tools/publish.ps1'
+      - 'VERSION'
+      - '.github/workflows/release.yml'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: '覆盖版本号（默认读取 VERSION 文件）'
+        required: false
+        default: ''
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  release:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Resolve version
+        id: ver
+        shell: pwsh
+        run: |
+          $override = '${{ github.event.inputs.version }}'
+          $version = if ($override) { $override } else { (Get-Content VERSION -Raw).Trim() }
+          if (-not $version) { throw 'VERSION is empty' }
+          if ($version -notmatch '^\d+\.\d+\.\d+([-.][0-9A-Za-z.-]+)?$') {
+            throw "invalid version: $version (expected 1.2.3)"
+          }
+          "version=$version" >> $env:GITHUB_OUTPUT
+          "tag=v$version" >> $env:GITHUB_OUTPUT
+
+      - name: Stamp assembly version
+        shell: pwsh
+        run: |
+          $version = '${{ steps.ver.outputs.version }}'
+          $numeric = ($version -replace '[^0-9.].*$', '').TrimEnd('.')
+          $parts = $numeric.Split('.')
+          while ($parts.Count -lt 4) { $parts += '0' }
+          $four = ($parts | Select-Object -First 4) -join '.'
+          $file = 'src/AssemblyInfo.cs'
+          $text = Get-Content -LiteralPath $file -Raw
+          $text = $text -replace 'AssemblyVersion\("[^"]*"\)', "AssemblyVersion(`"$four`")"
+          $text = $text -replace 'AssemblyFileVersion\("[^"]*"\)', "AssemblyFileVersion(`"$four`")"
+          $text = $text -replace 'AssemblyInformationalVersion\("[^"]*"\)', "AssemblyInformationalVersion(`"$version`")"
+          Set-Content -LiteralPath $file -Value $text -NoNewline -Encoding UTF8
+          Get-Content -LiteralPath $file
+
+      - name: Verify .NET Framework C# compiler is available
+        shell: pwsh
+        run: |
+          $candidates = @(
+            'C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe',
+            'C:\Windows\Microsoft.NET\Framework\v4.0.30319\csc.exe'
+          )
+          $found = $candidates | Where-Object { Test-Path $_ }
+          if (-not $found) { throw 'csc.exe not found in any candidate path' }
+          Write-Host "csc: $($found -join ', ')"
+
+      - name: Build artifacts
+        shell: pwsh
+        run: |
+          .\tools\publish.ps1 -Version '${{ steps.ver.outputs.version }}' -OutDir artifacts
+
+      - name: Create or update GitHub Release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          COMMIT: ${{ github.sha }}
+          TAG: ${{ steps.ver.outputs.tag }}
+          VERSION: ${{ steps.ver.outputs.version }}
+        run: |
+          $tag = $env:TAG
+          $version = $env:VERSION
+          $zipName = "WindowDock-$tag-win-x64.zip"
+          $headers = @{
+            Authorization = "Bearer $env:GH_TOKEN"
+            'User-Agent'  = 'windowdock-ci'
+            Accept        = 'application/vnd.github+json'
+          }
+          $api = "https://api.github.com/repos/$env:REPO"
+
+          # Single-quoted here-string: nothing is expanded by PowerShell, so
+          # backticks and Markdown stay literal. Only the two placeholders are replaced.
+          $body = @'
+          WindowDock **@@VERSION@@** — Windows 10/11 x64 免安装版（需要 .NET Framework 4.x）。
+
+          ### 下载
+          - **@@ZIPNAME@@**：解压后双击 `WindowDock.exe`。
+          - **WindowDock.exe**：独立 EXE，替换旧文件即可更新。
+          - **SHA256SUMS.txt**：两个发布文件的 SHA-256 校验值。
+
+          更新前退出旧实例，保留原有 `WindowDock.ini` 即可保留任务与设置。
+          默认快捷键 **Ctrl + Alt + Space**。
+
+          本 Release 由 `.github/workflows/release.yml` 在代码更新时自动构建生成。
+          下载页：https://qingniaoheyu.github.io/WindowDock/
+
+          提交：@@COMMIT@@
+          '@
+          $body = $body.Replace('@@VERSION@@', $version).Replace('@@ZIPNAME@@', $zipName).Replace('@@COMMIT@@', $env:COMMIT)
+
+          # Idempotent: reuse the release for this tag if it already exists.
+          $releaseId = $null
+          try {
+            $existing = Invoke-RestMethod -Uri "$api/releases/tags/$tag" -Headers $headers -TimeoutSec 30
+            $releaseId = $existing.id
+            Write-Host "existing release id $releaseId"
+          } catch {
+            Write-Host 'no existing release for this tag'
+          }
+
+          if ($releaseId) {
+            $payload = @{ name = "WindowDock $tag"; body = $body; draft = $false; prerelease = $false } | ConvertTo-Json
+            Invoke-RestMethod -Method Patch -Uri "$api/releases/$releaseId" -Headers $headers -Body $payload -ContentType 'application/json' -TimeoutSec 60 | Out-Null
+          } else {
+            $payload = @{
+              tag_name = $tag
+              name = "WindowDock $tag"
+              body = $body
+              draft = $false
+              prerelease = $false
+              target_commitish = $env:COMMIT
+            } | ConvertTo-Json
+            $rel = Invoke-RestMethod -Method Post -Uri "$api/releases" -Headers $headers -Body $payload -ContentType 'application/json' -TimeoutSec 60
+            $releaseId = $rel.id
+            Write-Host "created release $releaseId"
+          }
+
+          # Remove prior copies of our three assets so re-runs stay idempotent.
+          $old = Invoke-RestMethod -Uri "$api/releases/$releaseId/assets" -Headers $headers -TimeoutSec 60
+          $wanted = @('WindowDock.exe', $zipName, 'SHA256SUMS.txt')
+          foreach ($a in $old) {
+            if ($a.name -in $wanted) {
+              Invoke-RestMethod -Method Delete -Uri "$api/releases/assets/$($a.id)" -Headers $headers -TimeoutSec 60 | Out-Null
+              Write-Host "removed old asset $($a.name)"
+            }
+          }
+
+          # Upload the raw bytes with curl.exe (-T / --data-binary) to avoid
+          # PowerShell's request-body encoding of byte arrays.
+          foreach ($f in @("artifacts/WindowDock.exe", "artifacts/$zipName", "artifacts/SHA256SUMS.txt")) {
+            $path = (Resolve-Path $f).Path
+            $name = [IO.Path]::GetFileName($path)
+            $ct = if ($name -eq 'SHA256SUMS.txt') { 'text/plain' }
+                  elseif ($name.EndsWith('.zip')) { 'application/zip' }
+                  else { 'application/octet-stream' }
+            $uri = "https://uploads.github.com/repos/$env:REPO/releases/$releaseId/assets?name=" + [uri]::EscapeDataString($name)
+            $curlArgs = @(
+              '-sS', '--fail', '--retry', '3', '-X', 'POST',
+              '-H', "Authorization: Bearer $env:GH_TOKEN",
+              '-H', 'User-Agent: windowdock-ci',
+              '-H', 'Accept: application/vnd.github+json',
+              '-H', "Content-Type: $ct",
+              '--data-binary', "@$path",
+              $uri
+            )
+            & curl.exe @curlArgs | Out-Null
+            if ($LASTEXITCODE -ne 0) { throw "upload failed for $name (curl exit $LASTEXITCODE)" }
+            Write-Host "uploaded $name ($((Get-Item $path).Length) bytes)"
+          }
+
+      - name: Upload workflow artifacts (for inspection)
+        uses: actions/upload-artifact@v4
+        with:
+          name: windowdock-${{ steps.ver.outputs.tag }}
+          path: |
+            artifacts/WindowDock.exe
+            artifacts/WindowDock-*.zip
+            artifacts/SHA256SUMS.txt

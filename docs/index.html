@@ -1,0 +1,134 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>WindowDock · 下载</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; padding: 40px 20px 64px;
+    font: 16px/1.6 -apple-system, BlinkMacSystemFont, "Segoe UI", "Microsoft YaHei", Roboto, Helvetica, Arial, sans-serif;
+    color: #dce3ee; background: #14171c;
+  }
+  main { max-width: 760px; margin: 0 auto; }
+  h1 { font-size: 30px; margin: 0 0 6px; color: #fff; }
+  .sub { color: #8b97a8; margin: 0 0 28px; }
+  .card {
+    background: #1c2129; border: 1px solid #2c3441; border-radius: 14px;
+    padding: 24px; margin-bottom: 20px;
+  }
+  .ver { font-size: 13px; color: #8b97a8; letter-spacing: .04em; text-transform: uppercase; }
+  .tag { font-size: 26px; font-weight: 700; color: #fff; margin: 4px 0 14px; }
+  .btn {
+    display: inline-block; padding: 11px 22px; border-radius: 9px;
+    background: #3c7bdc; color: #fff; text-decoration: none; font-weight: 600;
+    margin: 4px 8px 8px 0;
+  }
+  .btn.sec { background: #2b3340; }
+  .btn:hover { filter: brightness(1.12); }
+  .meta { font-size: 13px; color: #8b97a8; margin-top: 12px; word-break: break-all; }
+  .meta code { color: #a9c6ff; }
+  .notice { padding: 14px 18px; border-radius: 10px; background: #2a2416; border: 1px solid #5a4a20; color: #e8d3a0; }
+  a.link { color: #7fb0ff; }
+  footer { margin-top: 28px; font-size: 13px; color: #6b7688; }
+  .shots { display: flex; flex-wrap: wrap; gap: 12px; margin-top: 8px; }
+  .shots img { max-width: 100%; width: 220px; border: 1px solid #2c3441; border-radius: 8px; }
+  h2 { font-size: 18px; color: #fff; margin: 0 0 10px; }
+</style>
+</head>
+<body>
+<main>
+  <h1>WindowDock</h1>
+  <p class="sub">Windows 桌面窗口停靠栏 · 网格布局 · 每任务独立截止时间 · 显示器变化后保持窗口可见</p>
+
+  <div id="app"><div class="notice" id="loading">正在读取最新 Release …</div></div>
+
+  <div class="card">
+    <h2>界面截图</h2>
+    <div class="shots">
+      <img src="screenshots/windowdock-main.png" alt="单排布局与任务清单">
+      <img src="screenshots/windowdock-grid.png" alt="田字格布局">
+      <img src="screenshots/windowdock-settings.png" alt="设置页面">
+    </div>
+  </div>
+
+  <footer>
+    适用于 Windows 10/11 x64（需要 .NET Framework 4.x）。免安装：解压后双击 <code>WindowDock.exe</code>。
+    源码与说明见 <a class="link" href="https://github.com/qingniaoheyu/WindowDock">GitHub 仓库</a>。
+    本页通过 GitHub Releases API 自动展示最新版本，发布后无需手动更新。
+  </footer>
+</main>
+
+<script>
+(function () {
+  var API = 'https://api.github.com/repos/qingniaoheyu/WindowDock/releases/latest';
+  var el = document.getElementById('app');
+
+  function esc(s) {
+    return String(s == null ? '' : s).replace(/[&<>"']/g, function (c) {
+      return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c];
+    });
+  }
+
+  function pick(assets, name) {
+    for (var i = 0; i < assets.length; i++) if (assets[i].name === name) return assets[i];
+    return null;
+  }
+
+  function card(r) {
+    var tag = esc(r.tag_name || '');
+    var name = esc(r.name || tag);
+    var published = r.published_at ? new Date(r.published_at).toLocaleDateString('zh-CN') : '';
+    var assets = r.assets || [];
+    var zip = null, exe = null, sums = null;
+
+    for (var i = 0; i < assets.length; i++) {
+      var n = assets[i].name;
+      if (/\.zip$/i.test(n) && !zip) zip = assets[i];
+      if (/\.exe$/i.test(n) && !exe) exe = assets[i];
+      if (/^SHA256SUMS\.txt$/i.test(n)) sums = assets[i];
+    }
+
+    var html = '<div class="card">';
+    html += '<div class="ver">最新版本 · ' + (published ? '发布于 ' + esc(published) : '') + '</div>';
+    html += '<div class="tag">' + name + ' <span style="font-size:14px;color:#8b97a8;font-weight:400">' + tag + '</span></div>';
+
+    if (zip) {
+      html += '<a class="btn" href="' + esc(zip.browser_download_url) + '">下载免安装 ZIP（' +
+        (zip.size / 1024).toFixed(0) + ' KB）</a>';
+    }
+    if (exe) {
+      html += '<a class="btn sec" href="' + esc(exe.browser_download_url) + '">仅下载 EXE（' +
+        (exe.size / 1024).toFixed(0) + ' KB）</a>';
+    }
+    if (!zip && !exe) {
+      html += '<div class="notice">此版本暂无构建产物，请稍后刷新或查看 Release 页面。</div>';
+    }
+    html += '<div class="meta">下载次数：' +
+      ((zip ? zip.download_count : exe ? exe.download_count : 0)) +
+      ' · <a class="link" href="' + esc(r.html_url) + '">Release 页面</a>' +
+      (sums ? ' · <a class="link" href="' + esc(sums.browser_download_url) + '">SHA256SUMS.txt</a>' : '') +
+      '</div>';
+    if (exe && exe.digest) {
+      html += '<div class="meta">EXE SHA-256：<code>' + esc(String(exe.digest).replace(/^sha256:/, '')) + '</code></div>';
+    }
+    html += '</div>';
+    return html;
+  }
+
+  fetch(API, { headers: { Accept: 'application/vnd.github+json' } })
+    .then(function (res) {
+      if (!res.ok) throw new Error('HTTP ' + res.status);
+      return res.json();
+    })
+    .then(function (r) { el.innerHTML = card(r); })
+    .catch(function (e) {
+      el.innerHTML = '<div class="notice">无法读取 Release 信息（' + esc(e.message) +
+        '）。可直接前往 <a class="link" href="https://github.com/qingniaoheyu/WindowDock/releases">Releases 页面</a> 下载。</div>';
+    });
+})();
+</script>
+</body>
+</html>
